@@ -1,0 +1,15 @@
+# Search
+
+
+### Link Dump
+https://pub.towardsai.net/hnsw-small-world-yes-but-how-in-the-world-is-it-navigable-77701ed37e20
+https://huggingface.co/mixedbread-ai/mxbai-embed-large-v1
+https://github.com/quickwit-oss/tantivy
+https://arxiv.org/abs/2501.05366
+https://github.com/ItsArnavSh/gitfindr
+https://exa.ai/
+https://huggingface.co/Menlo/Lucy-gguf
+
+https://ii.inc/web/blog/post/ii-search
+https://ii.inc/web/blog/post/ii-researcher
+https://github.com/Intelligent-Internet/ii-researcher

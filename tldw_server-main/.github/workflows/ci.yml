@@ -1,0 +1,373 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install mypy
+        run: |
+          python -m pip install --upgrade pip
+          pip install mypy
+
+      - name: MyPy (non-blocking)
+        run: |
+          set +e
+          mypy tldw_Server_API/
+          set -e
+
+  full-suite-linux:
+    name: Full Suite (Ubuntu / Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    services:
+      postgres:
+        image: postgres:18-bookworm
+        env:
+          POSTGRES_USER: tldw
+          POSTGRES_PASSWORD: tldw
+          POSTGRES_DB: tldw_content
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U tldw"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Ensure Python can import the top-level package `tldw_Server_API` and scripts
+      # by including the repository root on sys.path.
+      PYTHONPATH: .
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      TEST_MODE: 'true'
+      DISABLE_HEAVY_STARTUP: '1'
+      # Expose Postgres service to tests
+      POSTGRES_TEST_HOST: 127.0.0.1
+      POSTGRES_TEST_DB: tldw_content
+      POSTGRES_TEST_USER: tldw
+      POSTGRES_TEST_PASSWORD: tldw
+      TEST_DB_HOST: 127.0.0.1
+      TEST_DB_USER: tldw
+      TEST_DB_PASSWORD: tldw
+      TLDW_TEST_POSTGRES_REQUIRED: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      - name: Install FFmpeg and PortAudio (Linux)
+        uses: ./.github/actions/setup-ffmpeg
+        with:
+          install-portaudio: 'true'
+
+      - name: Setup Python and deps (with uv)
+        uses: ./.github/actions/setup-python-deps
+        with:
+          python-version: ${{ matrix.python }}
+          use-uv: 'true'
+          cache-dependency-path: |
+            pyproject.toml
+            uv.lock
+          extras: dev,multiplayer
+
+      - name: Install pg client and wait for PG
+        uses: ./.github/actions/wait-for-postgres
+        with:
+          host: 127.0.0.1
+          port: ${{ job.services.postgres.ports[5432] }}
+          user: tldw
+
+      - name: Export PG env vars
+        shell: bash
+        run: |
+          echo "POSTGRES_TEST_PORT=${{ job.services.postgres.ports[5432] }}" >> "$GITHUB_ENV"
+          echo "TEST_DB_PORT=${{ job.services.postgres.ports[5432] }}" >> "$GITHUB_ENV"
+
+      - name: Install additional deps for PG tests
+        run: |
+          python -m pip install --upgrade pip
+          pip install "psycopg[binary]>=3.1" pytest pytest-asyncio
+
+      - name: Verify pytest-asyncio import (Linux matrix)
+        shell: bash
+        run: |
+          python - <<'PY'
+          try:
+              import pytest_asyncio
+              import importlib
+              m = importlib.import_module('pytest_asyncio.plugin')
+              print('pytest_asyncio OK:', getattr(pytest_asyncio, '__version__', 'unknown'))
+          except Exception as e:
+              print('pytest_asyncio import failed:', e)
+              raise
+          PY
+
+      - name: Smoke start server (single-user)
+        env:
+          SERVER_LABEL: smoke
+          AUTH_MODE: single_user
+          SINGLE_USER_API_KEY: "smoke-ci-key-12345"
+          E2E_TEST_BASE_URL: "http://127.0.0.1:8000"
+          TEST_MODE: 'true'
+          DISABLE_HEAVY_STARTUP: '1'
+        shell: bash
+        run: |
+          python tldw_Server_API/tests/scripts/server_lifecycle.py start
+
+      - name: Smoke health check
+        if: always()
+        env:
+          SERVER_LABEL: smoke
+          E2E_TEST_BASE_URL: "http://127.0.0.1:8000"
+        shell: bash
+        run: |
+          python tldw_Server_API/tests/scripts/server_lifecycle.py health-check
+
+      - name: Print smoke server log on failure
+        if: failure()
+        env:
+          SERVER_LABEL: smoke
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          label = os.environ.get('SERVER_LABEL','smoke')
+          p = pathlib.Path(f'server-{label}.log')
+          if p.exists():
+              print('===== smoke server log =====')
+              print(p.read_text(encoding='utf-8'))
+          PY
+
+      - name: Smoke stop server
+        if: always()
+        env:
+          SERVER_LABEL: smoke
+        shell: bash
+        run: |
+          python tldw_Server_API/tests/scripts/server_lifecycle.py stop || true
+
+      - name: Cache embedding models
+        uses: actions/cache@v4
+        with:
+          path: models/embeddings
+          key: ${{ runner.os }}-embeddings-${{ hashFiles('Helper_Scripts/download_embedding_models.py') }}-v1
+          restore-keys: |
+            ${{ runner.os }}-embeddings-
+
+      - name: Pre-download embedding models
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub
+          python Helper_Scripts/download_embedding_models.py --target models/embeddings
+          echo "TLDW_EMBEDDING_MODELS_DIR=models/embeddings" >> "$GITHUB_ENV"
+
+      - name: Run full test suite (Linux + PG) - exclude Jobs and E2E
+        run: |
+          pytest -q --maxfail=1 --disable-warnings -p pytest_cov -p pytest_asyncio.plugin -m "not jobs and not e2e" \
+            --cov=tldw_Server_API --cov-report=xml --cov-report=term-missing \
+            --junit-xml=test-results-linux-${{ matrix.python }}.xml
+        shell: bash
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: full-suite-ubuntu-py${{ matrix.python }}
+          path: test-results-linux-${{ matrix.python }}.xml
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-ubuntu-py${{ matrix.python }}
+          path: coverage.xml
+
+      - name: Upload coverage to Codecov (Ubuntu 3.12)
+        if: matrix.python == '3.12'
+        uses: codecov/codecov-action@v5
+        with:
+          file: ./coverage.xml
+          flags: fullsuite
+          name: codecov-linux-py312
+          fail_ci_if_error: false
+
+  full-suite-os:
+    name: Full Suite (${{ matrix.os }} / Python 3.12)
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    needs: lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    env:
+      # Ensure Python can import the top-level package `tldw_Server_API` and scripts
+      # by including the repository root on sys.path.
+      PYTHONPATH: .
+      PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+      TEST_MODE: 'true'
+      DISABLE_HEAVY_STARTUP: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
+
+      - name: Install FFmpeg (multi-OS)
+        uses: ./.github/actions/setup-ffmpeg
+        with:
+          install-portaudio: 'true'
+
+      - name: Setup Python and deps (with uv)
+        uses: ./.github/actions/setup-python-deps
+        with:
+          python-version: '3.12'
+          use-uv: 'true'
+          cache-dependency-path: |
+            pyproject.toml
+            uv.lock
+          extras: dev
+
+      - name: Ensure pytest-asyncio installed (OS matrix)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-asyncio
+
+      - name: Verify pytest-asyncio import (OS matrix)
+        shell: bash
+        run: |
+          python - <<'PY'
+          try:
+              import pytest_asyncio
+              import importlib
+              m = importlib.import_module('pytest_asyncio.plugin')
+              print('pytest_asyncio OK:', getattr(pytest_asyncio, '__version__', 'unknown'))
+          except Exception as e:
+              print('pytest_asyncio import failed:', e)
+              raise
+          PY
+
+      - name: Smoke start server (single-user)
+        env:
+          SERVER_LABEL: smoke
+          AUTH_MODE: single_user
+          SINGLE_USER_API_KEY: "smoke-ci-key-12345"
+          E2E_TEST_BASE_URL: "http://127.0.0.1:8000"
+          TEST_MODE: 'true'
+          DISABLE_HEAVY_STARTUP: '1'
+        shell: bash
+        run: |
+          python tldw_Server_API/tests/scripts/server_lifecycle.py start
+
+      - name: Smoke health check (Windows, 8 min)
+        if: ${{ always() && matrix.os == 'windows-latest' }}
+        env:
+          SERVER_LABEL: smoke
+          E2E_TEST_BASE_URL: "http://127.0.0.1:8000"
+          SMOKE_STARTUP_TIMEOUT_SECONDS: '480'
+        shell: bash
+        run: |
+          python tldw_Server_API/tests/scripts/server_lifecycle.py health-check
+
+      - name: Smoke health check (non-Windows)
+        if: ${{ always() && matrix.os != 'windows-latest' }}
+        env:
+          SERVER_LABEL: smoke
+          E2E_TEST_BASE_URL: "http://127.0.0.1:8000"
+          SMOKE_STARTUP_TIMEOUT_SECONDS: '180'
+        shell: bash
+        run: |
+          python tldw_Server_API/tests/scripts/server_lifecycle.py health-check
+
+      - name: Print smoke server log on failure
+        if: failure()
+        env:
+          SERVER_LABEL: smoke
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          label = os.environ.get('SERVER_LABEL','smoke')
+          p = pathlib.Path(f'server-{label}.log')
+          if p.exists():
+              print('===== smoke server log =====')
+              print(p.read_text(encoding='utf-8'))
+          PY
+
+      - name: Smoke stop server
+        if: always()
+        env:
+          SERVER_LABEL: smoke
+        shell: bash
+        run: |
+          python tldw_Server_API/tests/scripts/server_lifecycle.py stop || true
+
+      - name: Cache embedding models
+        uses: actions/cache@v4
+        with:
+          path: models/embeddings
+          key: ${{ runner.os }}-embeddings-${{ hashFiles('Helper_Scripts/download_embedding_models.py') }}-v1
+          restore-keys: |
+            ${{ runner.os }}-embeddings-
+
+      - name: Pre-download embedding models
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install huggingface_hub
+          python Helper_Scripts/download_embedding_models.py --target models/embeddings
+          echo "TLDW_EMBEDDING_MODELS_DIR=models/embeddings" >> "$GITHUB_ENV"
+
+      - name: Run full test suite - exclude Jobs and E2E
+        run: |
+          pytest -q --maxfail=1 --disable-warnings -p pytest_cov -p pytest_asyncio.plugin -m "not jobs and not e2e" \
+            --cov=tldw_Server_API --cov-report=xml --cov-report=term-missing \
+            --junit-xml=test-results-${{ matrix.os }}-3.12.xml
+        shell: bash
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: full-suite-${{ matrix.os }}-py3.12
+          path: test-results-${{ matrix.os }}-3.12.xml
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: coverage-${{ matrix.os }}-py3.12
+          path: coverage.xml
